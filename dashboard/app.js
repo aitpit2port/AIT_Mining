@@ -57,15 +57,23 @@
     fixedDownloads.forEach(id=>{const el=$(id);if(el){el.hidden=!canDownload();el.disabled=!canDownload()}});
   }
   function updateGlobalExport(){const el=$('exportBtn');if(!el)return;const allowed=canExport(activePage);el.hidden=!allowed;el.disabled=!allowed}
-  function goPage(requestedPage){
+  async function goPage(requestedPage){
     const page=canonicalPage(requestedPage);
     if(!canPage(page)){showToast('ليس لديك صلاحية لفتح هذه الصفحة');return false}
+    try{
+      if(window.AITPageData&&!window.AITPageData.isLoaded(page)){
+        showToast('جارٍ تحميل بيانات الصفحة...');
+        await window.AITPageData.ensurePage(page);
+        refreshPageData(page);
+      }
+    }catch(err){const text=err?.message||String(err);if(/session|authentication|auth_required|session_invalid|session_expired/i.test(text)){window.AITBackend?.clearSession?.();location.reload();return false}showToast(text);return false}
     activePage=page;
     $$('.nav,.page').forEach(x=>x.classList.remove('active'));
     $(`.nav[data-page="${page}"]`)?.classList.add('active');
     $(page)?.classList.add('active');
     $('pageTitle').textContent=window.GeoMineI18N?.translate(pageTitles[page]||page)||page;
     if(page==='map_layers') setTimeout(()=>geoMap?.invalidateSize(),100);
+    if(page==='downloads')window.GeoMineDownloads?.ensureLoaded?.();
     if(window.innerWidth<621) $('sidebar')?.classList.remove('open');
     updateGlobalExport();
     window.scrollTo({top:0,behavior:'smooth'});
@@ -102,10 +110,13 @@
   }
   function buildOreCounts(){
     const out={};
+    if(!(D.excel_occurrences||[]).length){
+      Object.entries(D.overviewStats?.excelOreCounts||{}).forEach(([name,count])=>{out[name]=(out[name]||0)+Number(count||0)});
+    }
     [...(D.gdb_ore_points||[]),...(D.excel_occurrences||[])].forEach(r=>splitOreNames(r.Ore_Name).forEach(o=>out[o]=(out[o]||0)+1));
     return out;
   }
-  const oreCounts=buildOreCounts();
+  let oreCounts=buildOreCounts();
 
   function renderBars(id, entries, options={}){
     const el=$(id); if(!el) return;
@@ -166,9 +177,13 @@
     const bins=[0,.01,.1,.5,1,2,5,10,Infinity],labels=['0-.01','.01-.1','.1-.5','.5-1','1-2','2-5','5-10','>10'],vals=labels.map(()=>0);
     au.forEach(v=>{for(let i=0;i<bins.length-1;i++)if(v>=bins[i]&&v<bins[i+1]){vals[i]++;break;}});renderSvgBars('auHistogram',labels,vals);
     $('auStats').innerHTML=[['أعلى قيمة',au.length?Math.max(...au):0],['المتوسط',avg(au)],['الوسيط',median(au)]].map(x=>`<div class="mini-stat"><span>${x[0]}</span><b>${fmt(x[1],3)} ppm</b></div>`).join('');
-    const geoAll=[...(D.gdb_ore_points||[]),...(D.excel_occurrences||[])],coordOk=geoAll.filter(r=>num(r.centroid_lat??r.latitude)!==null&&num(r.centroid_lon??r.longitude)!==null).length;
+    const gdbGeo=D.gdb_ore_points||[],excelGeo=D.excel_occurrences||[];
+    const gdbCoord=gdbGeo.filter(r=>num(r.centroid_lat)!==null&&num(r.centroid_lon)!==null).length;
+    const excelTotal=excelGeo.length||Number(D.overviewStats?.excelCoordinateTotal||0);
+    const excelCoord=excelGeo.length?excelGeo.filter(r=>num(r.latitude)!==null&&num(r.longitude)!==null).length:Number(D.overviewStats?.excelCoordinateOk||0);
+    const geoTotal=gdbGeo.length+excelTotal,coordOk=gdbCoord+excelCoord;
     const layers=D.geological_layers||[],ready=layers.filter(l=>String(l.status||'').includes('جاهز')).length,precise=layers.filter(l=>String(l.bounds_quality||'').includes('دقيق')).length;
-    const q1=counts.source_file_instances?counts.unique_files/counts.source_file_instances*100:0,q2=geoAll.length?coordOk/geoAll.length*100:0,q3=layers.length?ready/layers.length*100:0,q4=counts.unique_pdf_documents?counts.searchable_pdf_documents/counts.unique_pdf_documents*100:0;
+    const q1=counts.source_file_instances?counts.unique_files/counts.source_file_instances*100:0,q2=geoTotal?coordOk/geoTotal*100:0,q3=layers.length?ready/layers.length*100:0,q4=counts.unique_pdf_documents?counts.searchable_pdf_documents/counts.unique_pdf_documents*100:0;
     const quality=Math.round(avg([q1,q2,q3,q4]));$('qualityPct').textContent=quality+'%';$('qualityGauge').style.setProperty('--pct',quality);
     $('qualityList').innerHTML=[['ملفات فريدة بدون تكرار',Math.round(q1)+'%'],['سجلات بإحداثيات',Math.round(q2)+'%'],['طبقات جاهزة للعرض',Math.round(q3)+'%'],['PDF بنص مضمّن',Math.round(q4)+'%'],['طبقات دقيقة الإحداثيات',`${precise}/${layers.length}`]].map(x=>`<div class="quality-row"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
     renderBars('oreOverviewBars',Object.entries(oreCounts).sort((a,b)=>b[1]-a[1]),{limit:8});
@@ -196,14 +211,15 @@
   // Overview map
   let overviewMap=null;
   async function initOverviewMap(){
-    if(typeof L==='undefined'||!$('overviewMap'))return;
+    if(overviewMap||typeof L==='undefined'||!$('overviewMap'))return;
     overviewMap=L.map('overviewMap',{center:[26,33.5],zoom:6,zoomControl:true,attributionControl:false,scrollWheelZoom:false});
     L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:18}).addTo(overviewMap);
-    const addGeo=async(asset,style,point)=>{if(!asset)return;try{const gj=await fetch(asset).then(r=>r.json());L.geoJSON(gj,{style,pointToLayer:(f,ll)=>L.circleMarker(ll,point||style)}).addTo(overviewMap)}catch(e){console.warn(e)}};
-    const layerAsset=id=>(D.geological_layers||[]).find(x=>x.layer_id===id)?.asset;
-    await addGeo(layerAsset('VECTOR-GDB-BOUNDARY'),{color:'#d8a62c',weight:1,fillOpacity:.02});
-    await addGeo(layerAsset('VECTOR-GDB-ORE-POINT'),{},{radius:2.5,color:'#0a4027',fillColor:'#23bd78',fillOpacity:.85,weight:1});
-    await addGeo(layerAsset('VECTOR-MINES'),{},{radius:4,color:'#0b3250',fillColor:'#23a5e6',fillOpacity:.95,weight:1.5});
+    const addGeo=async(id,style,point)=>{const layer=(D.geological_layers||[]).find(x=>x.layer_id===id);if(!layer)return;try{const asset=await ensureVectorAsset(layer);if(!asset)return;const gj=await fetch(asset).then(r=>r.json());L.geoJSON(gj,{style,pointToLayer:(f,ll)=>L.circleMarker(ll,point||style)}).addTo(overviewMap)}catch(e){console.warn(e)}};
+    Promise.all([
+      addGeo('VECTOR-GDB-BOUNDARY',{color:'#d8a62c',weight:1,fillOpacity:.02}),
+      addGeo('VECTOR-GDB-ORE-POINT',{},{radius:2.5,color:'#0a4027',fillColor:'#23bd78',fillOpacity:.85,weight:1}),
+      addGeo('VECTOR-MINES',{},{radius:4,color:'#0b3250',fillColor:'#23a5e6',fillOpacity:.95,weight:1.5})
+    ]).catch(console.warn);
   }
 
   // Main map
@@ -225,6 +241,18 @@
   };
   function layerColor(l){return l.color||layerStyles[l.layer_id]?.color||layerStyles[l.layer_id]?.fillColor||'#fff'}
   function qualityClass(l){return String(l.bounds_quality||'').includes('دقيق')?'precise':'estimated'}
+  async function ensureVectorAsset(l){
+    if(!l||l.layer_type==='raster')return l?.asset||'';
+    if(l.asset)return l.asset;
+    if(l._assetPromise)return l._assetPromise;
+    l._assetPromise=AITBackend.mapLayerData(l.layer_id).then(detail=>{
+      if(!detail?.geojson)throw new Error('MAP_ASSET_NOT_FOUND');
+      l.drive_file_id=detail.drive_file_id||l.drive_file_id||'';
+      l.asset=URL.createObjectURL(new Blob([JSON.stringify(detail.geojson)],{type:'application/geo+json'}));
+      return l.asset;
+    }).catch(err=>{l._assetPromise=null;throw err});
+    return l._assetPromise;
+  }
   async function addLayer(l,fit=false){
     if(!geoMap||activeLayers[l.layer_id]){if(fit&&activeLayers[l.layer_id]?.getBounds)geoMap.fitBounds(activeLayers[l.layer_id].getBounds(),{padding:[20,20]});return activeLayers[l.layer_id];}
     try{
@@ -233,7 +261,8 @@
         layer=L.imageOverlay(l.asset,l.bounds,{opacity:Number(l.default_opacity)||.55,interactive:true});
         layer.on('click',()=>inspectLayer(l));
       }else{
-        const gj=await fetch(l.asset).then(r=>r.json()),st=layerStyles[l.layer_id]||{color:layerColor(l),weight:1.5,fillOpacity:.15,radius:4,fillColor:layerColor(l)};
+        const asset=await ensureVectorAsset(l);if(!asset)throw new Error('MAP_ASSET_NOT_FOUND');
+        const gj=await fetch(asset).then(r=>r.json()),st=layerStyles[l.layer_id]||{color:layerColor(l),weight:1.5,fillOpacity:.15,radius:4,fillColor:layerColor(l)};
         layer=L.geoJSON(gj,{style:st,pointToLayer:(f,ll)=>L.circleMarker(ll,st),onEachFeature:(f,ly)=>{const p=f.properties||{};ly.on('click',()=>{inspectLayer(l,p);const rows=Object.entries(p).filter(([,v])=>v!==null&&v!==''&&v!==undefined&&typeof v!=='object').slice(0,12).map(([k,v])=>`<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join('');ly.bindPopup(`<table>${rows}</table>`).openPopup();});}});
       }
       layer.addTo(geoMap);activeLayers[l.layer_id]=layer;
@@ -269,7 +298,7 @@
   }
   function activateLayerById(id,fit=false){const l=(D.geological_layers||[]).find(x=>x.layer_id===id);if(l){inspectLayer(l);addLayer(l,fit);}}
   async function initMainMap(){
-    if(typeof L==='undefined'||!$('geoMap'))return;
+    if(geoMap||typeof L==='undefined'||!$('geoMap'))return;
     geoMap=L.map('geoMap',{center:[26,33.6],zoom:6,zoomControl:true});
     baseMaps.sat=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19});
     baseMaps.street=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19});
@@ -290,10 +319,15 @@
   $('collapseLayers')?.addEventListener('click',()=>{const p=document.querySelector('.layer-panel');p.classList.toggle('collapsed');document.querySelector('.map-workspace').style.gridTemplateColumns=p.classList.contains('collapsed')?'62px 1fr':'';setTimeout(()=>geoMap?.invalidateSize(),260)});
 
   // Geology
-  const geoRows=[
-    ...(D.gdb_ore_points||[]).map(r=>({...r,_source:'gdb',_sourceLabel:'File GDB',_lat:r.centroid_lat,_lon:r.centroid_lon})),
-    ...(D.excel_occurrences||[]).map(r=>({...r,_source:'excel',_sourceLabel:'Excel',_lat:r.latitude,_lon:r.longitude}))
-  ];
+  let geoRows=[];
+  function rebuildDerivedData(){
+    oreCounts=buildOreCounts();
+    geoRows=[
+      ...(D.gdb_ore_points||[]).map(r=>({...r,_source:'gdb',_sourceLabel:'File GDB',_lat:r.centroid_lat,_lon:r.centroid_lon})),
+      ...(D.excel_occurrences||[]).map(r=>({...r,_source:'excel',_sourceLabel:'Excel',_lat:r.latitude,_lon:r.longitude}))
+    ];
+  }
+  rebuildDerivedData();
   function initGeology(){
     const oreOptions=[...new Set(geoRows.flatMap(r=>splitOreNames(r.Ore_Name)))].sort((a,b)=>a.localeCompare(b,'ar'));
     $('oreFilter').innerHTML='<option value="">كل الخامات</option>'+oreOptions.map(x=>`<option>${esc(x)}</option>`).join('');
@@ -451,18 +485,23 @@
     if($('scopeText'))$('scopeText').textContent=tr(roleMode==='owner'?'لوحة قرار لصاحب الشركة':'مساحة تحليل للجيولوجي');
   });
 
-  // Initialisation
+  // Initialisation and page refresh after lazy data arrives.
+  const initializedPages=new Set();
+  function refreshPageData(page){
+    page=canonicalPage(page);rebuildDerivedData();
+    if(page==='overview'){renderOverview();initOverviewMap();initializedPages.add(page)}
+    else if(page==='geology'){initGeology();initializedPages.add(page)}
+    else if(page==='samples'){initSamples();initializedPages.add(page)}
+    else if(page==='mines'){initMines();initializedPages.add(page)}
+    else if(page==='documents'){initDocuments();initializedPages.add(page)}
+    else if(page==='data_library'){initData();initializedPages.add(page)}
+    else if(page==='map_layers'){initMainMap();renderLayerList();initializedPages.add(page)}
+  }
+  window.addEventListener('ait:page-data-ready',e=>{const page=e.detail?.page;if(page&&page===activePage)refreshPageData(page)});
   function init(){
     applyPermissionUI();initUserIdentity();
-    if(canPage('overview')){renderOverview();initOverviewMap()}
-    if(canPage('geology'))initGeology();
-    if(canPage('samples'))initSamples();
-    if(canPage('mines'))initMines();
-    if(canPage('documents'))initDocuments();
-    if(canPage('data_library'))initData();
-    if(canPage('map_layers'))initMainMap();
     const first=canPage('overview')?'overview':firstAllowedPage();
-    if(first)goPage(first);else showToast('لا توجد صفحات متاحة لهذا المستخدم');
+    if(first){refreshPageData(first);goPage(first)}else showToast('لا توجد صفحات متاحة لهذا المستخدم');
   }
   init();
 })();
